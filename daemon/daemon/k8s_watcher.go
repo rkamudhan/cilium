@@ -75,6 +75,22 @@ func (d *Daemon) EnableK8sWatcher(reSyncPeriod time.Duration) error {
 	)
 	go endpointController.Run(wait.NeverStop)
 
+	// We only care about ingress in LBMode
+	if d.conf.LBMode {
+		_, ingressController := cache.NewInformer(
+			cache.NewListWatchFromClient(d.k8sClient.Extensions().GetRESTClient(),
+				"ingresses", v1.NamespaceAll, fields.Everything()),
+			&v1beta1.Ingress{},
+			reSyncPeriod,
+			cache.ResourceEventHandlerFuncs{
+				AddFunc:    d.ingressAddFn,
+				UpdateFunc: d.ingressModFn,
+				DeleteFunc: d.ingressDelFn,
+			},
+		)
+		go ingressController.Run(wait.NeverStop)
+	}
+
 	return nil
 }
 
@@ -262,7 +278,7 @@ func areIPsConsistent(ipv4Enabled, isSvcIPv4 bool, svc types.K8sServiceNamespace
 
 	if isSvcIPv4 {
 		if !ipv4Enabled {
-			log.Warningf("Received an IPv4 kubernetes service but IPv4 is"+
+			log.Warningf("Received an IPv4 kubernetes service but IPv4 is "+
 				"disabled in the cilium daemon. Ignoring service %+v", svc)
 			return false
 		}
@@ -437,4 +453,54 @@ func (d *Daemon) syncLB(newSN, modSN, delSN *types.K8sServiceNamespace) {
 		// Add new services
 		addSN(*newSN)
 	}
+}
+
+func (d *Daemon) ingressAddFn(obj interface{}) {
+	ingress, ok := obj.(*v1beta1.Ingress)
+	if !ok {
+		return
+	}
+
+	if ingress.Spec.Backend == nil {
+		return
+	}
+
+	svcName := types.K8sServiceNamespace{
+		Service:   ingress.Spec.Backend.ServiceName,
+		Namespace: ingress.Namespace,
+	}
+
+	d.loadBalancer.K8sMU.Lock()
+	defer d.loadBalancer.K8sMU.Unlock()
+	k8sEP, ok := d.loadBalancer.K8sEndpoints[svcName]
+	if !ok {
+		log.Debugf("k8s endpoint not found")
+		// TODO at least store the poor ingress guy
+		return
+	}
+
+	ingressPort := ingress.Spec.Backend.ServicePort.IntValue()
+	var 	host net.IP
+	if d.conf.IPv4Enabled {
+		host = d.conf.HostV4Addr
+	} else {
+		host = d.conf.HostV6Addr
+	}
+	fePort, err := types.NewFEPort(types.TCP, uint16(ingressPort))
+	if err != nil {
+		return
+	}
+
+	ingressSvcInfo := types.NewK8sServiceInfo(host)
+	ingressSvcInfo.Ports[types.FEPortName(ingress.Spec.Backend.ServicePort.StrVal)] = fePort
+
+	d.addK8sSVCs(svcName, ingressSvcInfo, k8sEP)
+}
+
+func (d *Daemon) ingressModFn(oldObj interface{}, newObj interface{}) {
+	log.Debugf("Modified ingress %+v->%+v", oldObj, newObj)
+}
+
+func (d *Daemon) ingressDelFn(obj interface{}) {
+	log.Debugf("Deleted ingress %+v->%+v", obj)
 }

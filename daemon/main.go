@@ -370,7 +370,7 @@ func initEnv(ctx *cli.Context) error {
 	}
 
 	config.Opts.Set(endpoint.OptionDropNotify, true)
-	config.Opts.Set(endpoint.OptionNAT46, true)
+	config.Opts.Set(endpoint.OptionNAT46, false)
 	config.Opts.Set(daemon.OptionPolicyTracing, enableTracing)
 	config.Opts.Set(endpoint.OptionConntrack, !disableConntrack)
 	config.Opts.Set(endpoint.OptionConntrackAccounting, !disableConntrack)
