@@ -20,11 +20,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/policy"
 )
 
-func (e *Endpoint) checkEgressAccess(owner Owner, opts option.OptionMap, dstID policy.NumericIdentity, opt string) {
+func (e *Endpoint) checkEgressAccess(owner Owner, opts models.ConfigurationMap, dstID policy.NumericIdentity, opt string) {
 	var err error
 
 	ctx := policy.SearchContext{
@@ -43,9 +43,9 @@ func (e *Endpoint) checkEgressAccess(owner Owner, opts option.OptionMap, dstID p
 
 	switch owner.GetPolicyTree().Allows(&ctx) {
 	case policy.ACCEPT, policy.ALWAYS_ACCEPT:
-		opts[opt] = true
+		opts[opt] = "enabled"
 	case policy.DENY:
-		opts[opt] = false
+		opts[opt] = "disabled"
 	}
 }
 
@@ -97,6 +97,7 @@ func (e *Endpoint) regenerateConsumable(owner Owner) (bool, error) {
 		return false, nil
 	}
 
+	log.Debugf("Locking policy tree")
 	tree := owner.GetPolicyTree()
 	tree.Mutex.RLock()
 	cache := owner.GetConsumableCache()
@@ -109,6 +110,7 @@ func (e *Endpoint) regenerateConsumable(owner Owner) (bool, error) {
 	}
 	tree.Mutex.RUnlock()
 
+	// FIXME: Move to outer loops to avoid refetching
 	maxID, err := owner.GetMaxLabelID()
 	if err != nil {
 		return false, err
@@ -127,6 +129,7 @@ func (e *Endpoint) regenerateConsumable(owner Owner) (bool, error) {
 		c.Consumers[k].DeletionMark = true
 	}
 
+	log.Debugf("Locking policy tree")
 	tree.Mutex.RLock()
 	newL4policy := tree.ResolveL4Policy(&ctx)
 	c.L4Policy = newL4policy
@@ -142,6 +145,7 @@ func (e *Endpoint) regenerateConsumable(owner Owner) (bool, error) {
 
 	// Iterate over all possible assigned search contexts
 	idx := policy.MinimalNumericIdentity
+	log.Debugf("iterating from %+v to %+v", idx, maxID)
 	for idx < maxID {
 		if err := e.evaluateConsumerSource(owner, &ctx, idx); err != nil {
 			// FIXME: clear policy because it is inconsistent
@@ -151,6 +155,7 @@ func (e *Endpoint) regenerateConsumable(owner Owner) (bool, error) {
 	}
 	tree.Mutex.RUnlock()
 
+	log.Debugf("Deleting unused consumers")
 	// Garbage collect all unused entries
 	for _, val := range c.Consumers {
 		if val.DeletionMark {
@@ -169,20 +174,23 @@ func (e *Endpoint) regenerateConsumable(owner Owner) (bool, error) {
 }
 
 func (e *Endpoint) regeneratePolicy(owner Owner) (bool, error) {
+	log.Debugf("Regenerating consumable...")
 	policyChanged, err := e.regenerateConsumable(owner)
 	if err != nil {
 		return false, err
 	}
 
-	opts := make(option.OptionMap)
+	log.Debugf("Checking egress access")
+	opts := make(models.ConfigurationMap)
 	e.checkEgressAccess(owner, opts, policy.ID_HOST, OptionAllowToHost)
 	e.checkEgressAccess(owner, opts, policy.ID_WORLD, OptionAllowToWorld)
 
 	// L4 policy requires connection tracking
 	if e.Consumable != nil && e.Consumable.L4Policy != nil {
-		opts[OptionConntrack] = true
+		opts[OptionConntrack] = "enabled"
 	}
 
+	log.Debugf("Applying options")
 	optsChanged := e.ApplyOpts(opts)
 
 	return policyChanged || optsChanged, nil
@@ -268,12 +276,14 @@ func (e *Endpoint) TriggerPolicyUpdates(owner Owner) error {
 		return nil
 	}
 
+	log.Debugf("Regenerating policy...")
 	optionChanges, err := e.regeneratePolicy(owner)
 	if err != nil {
 		return err
 	}
 
 	if optionChanges {
+		log.Debugf("Regenerating endpoint...")
 		return e.regenerateLocked(owner)
 	}
 
@@ -296,6 +306,10 @@ func (e *Endpoint) SetIdentity(owner Owner, id *policy.Identity) {
 	}
 	e.SecLabel = id
 	e.Consumable = cache.GetOrCreate(id.ID, id)
+
+	if e.State == StateWaitingForIdentity {
+		e.State = StateReady
+	}
 
 	log.Debug("Set identity to %+v and consumable to %+v", id, e.Consumable)
 }

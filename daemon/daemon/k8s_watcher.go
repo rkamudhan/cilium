@@ -323,7 +323,7 @@ func (d *Daemon) delK8sSVCs(svc types.K8sServiceNamespace, svcInfo *types.K8sSer
 			continue
 		}
 
-		if err := d.SVCDelete(*fe); err != nil {
+		if err := d.svcDeleteByFrontend(fe); err != nil {
 			log.Warningf("Error deleting service %+v, %s", fe, err)
 		} else {
 			log.Debugf("# cilium lb delete-service %s %d 0", svcInfo.FEIP, svcPort.Port)

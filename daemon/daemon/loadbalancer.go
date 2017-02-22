@@ -18,9 +18,14 @@ package daemon
 import (
 	"fmt"
 
+	"github.com/cilium/cilium/api/v1/models"
+	. "github.com/cilium/cilium/api/v1/server/restapi/service"
 	"github.com/cilium/cilium/bpf/lbmap"
 	"github.com/cilium/cilium/common/types"
+	"github.com/cilium/cilium/pkg/apierror"
 	"github.com/cilium/cilium/pkg/bpf"
+
+	"github.com/go-openapi/runtime/middleware"
 )
 
 // addSVC2BPFMap adds the given bpf service to the bpf maps. If addRevNAT is set, adds the
@@ -64,14 +69,8 @@ func (d *Daemon) SVCAdd(feL3n4Addr types.L3n4AddrID, beL3n4Addr []types.L3n4Addr
 		}
 	}
 
-	feAddr256Sum, err := feAddr.L3n4Addr.SHA256Sum()
-	if err != nil {
-		return fmt.Errorf("unable to calculate SHA256Sum of %s: %s", feAddr.String(), err)
-	}
-	feL3n4Addr256Sum, err := feL3n4Addr.L3n4Addr.SHA256Sum()
-	if err != nil {
-		return fmt.Errorf("unable to calculate SHA256Sum of %s: %s", feL3n4Addr.String(), err)
-	}
+	feAddr256Sum := feAddr.L3n4Addr.SHA256Sum()
+	feL3n4Addr256Sum := feL3n4Addr.L3n4Addr.SHA256Sum()
 
 	if feAddr256Sum != feL3n4Addr256Sum {
 		return fmt.Errorf("service ID %d is already registered to service %s, please choose a different ID", feL3n4Addr.ID, feAddr.String())
@@ -95,16 +94,12 @@ func (d *Daemon) svcAdd(feL3n4Addr types.L3n4AddrID, beL3n4Addr []types.L3n4Addr
 	}
 
 	svc := types.LBSVC{
-		FE:  feL3n4Addr,
-		BES: beL3n4AddrCpy,
+		FE:     feL3n4Addr,
+		BES:    beL3n4AddrCpy,
+		Sha256: feL3n4Addr.L3n4Addr.SHA256Sum(),
 	}
 
 	fe, besValues, err := lbmap.LBSVC2ServiceKeynValue(svc)
-	if err != nil {
-		return err
-	}
-
-	feL3n4Uniq, err := feL3n4Addr.L3n4Addr.SHA256Sum()
 	if err != nil {
 		return err
 	}
@@ -117,101 +112,135 @@ func (d *Daemon) svcAdd(feL3n4Addr types.L3n4AddrID, beL3n4Addr []types.L3n4Addr
 		return err
 	}
 
-	d.loadBalancer.SVCMap[feL3n4Uniq] = svc
+	d.loadBalancer.AddService(svc)
 
 	return nil
 }
 
-// SVCDelete deletes the frontend from the local bpf map.
-func (d *Daemon) SVCDelete(feL3n4 types.L3n4Addr) error {
-	feL3n4Uniq, err := feL3n4.SHA256Sum()
+type putServiceID struct {
+	d *Daemon
+}
+
+func NewPutServiceIDHandler(d *Daemon) PutServiceIDHandler {
+	return &putServiceID{d: d}
+}
+
+func (h *putServiceID) Handle(params PutServiceIDParams) middleware.Responder {
+	f, err := types.NewL3n4AddrFromModel(params.Config.FrontendAddress)
 	if err != nil {
-		return err
+		return apierror.Error(PutServiceIDInvalidCode, err)
 	}
 
-	var svcKey lbmap.ServiceKey
-	if !feL3n4.IsIPv6() {
-		svcKey = lbmap.NewService4Key(feL3n4.IP, feL3n4.Port, 0)
-	} else {
-		svcKey = lbmap.NewService6Key(feL3n4.IP, feL3n4.Port, 0)
+	frontend := types.L3n4AddrID{
+		L3n4Addr: *f,
+		ID:       types.ServiceID(*params.Config.ID),
 	}
 
-	svcKey.SetBackend(0)
-
-	d.loadBalancer.BPFMapMU.Lock()
-	defer d.loadBalancer.BPFMapMU.Unlock()
-	err = lbmap.DeleteService(svcKey)
-	// TODO should we delete even if err is != nil?
-	if err == nil {
-		delete(d.loadBalancer.SVCMap, feL3n4Uniq)
-	}
-	return err
-}
-
-// SVCDeleteBySHA256Sum deletes the frontend from the local bpf map by its SHA256Sum.
-func (d *Daemon) SVCDeleteBySHA256Sum(feL3n4SHA256Sum string) error {
-	d.loadBalancer.BPFMapMU.Lock()
-	defer d.loadBalancer.BPFMapMU.Unlock()
-
-	svc, ok := d.loadBalancer.SVCMap[feL3n4SHA256Sum]
-	if !ok {
-		return nil
-	}
-	feL3n4 := svc.FE
-
-	var svcKey lbmap.ServiceKey
-	if !feL3n4.IsIPv6() {
-		svcKey = lbmap.NewService4Key(feL3n4.IP, feL3n4.Port, 0)
-	} else {
-		svcKey = lbmap.NewService6Key(feL3n4.IP, feL3n4.Port, 0)
-	}
-
-	svcKey.SetBackend(0)
-
-	err := lbmap.DeleteService(svcKey)
-	// TODO should we delete even if err is != nil?
-	if err == nil {
-		delete(d.loadBalancer.SVCMap, feL3n4SHA256Sum)
-	}
-	return err
-}
-
-// SVCDeleteAll deletes all IPv4 addresses, if IPv4 is enabled on daemon, and all IPv6
-// services stored on the daemon and on the bpf maps.
-func (d *Daemon) SVCDeleteAll() error {
-	d.loadBalancer.BPFMapMU.Lock()
-	defer d.loadBalancer.BPFMapMU.Unlock()
-
-	if d.conf.IPv4Enabled {
-		if err := lbmap.Service4Map.DeleteAll(); err != nil {
-			return err
+	backends := []types.L3n4Addr{}
+	for _, v := range params.Config.BackendAddresses {
+		if b, err := types.NewL3n4AddrFromBackendModel(v); err != nil {
+			return apierror.Error(PutServiceIDInvalidCode, err)
+		} else {
+			backends = append(backends, *b)
 		}
 	}
-	if err := lbmap.Service6Map.DeleteAll(); err != nil {
+
+	revnat := false
+	if params.Config.Flags != nil {
+		revnat = params.Config.Flags.DirectServerReturn
+	}
+
+	if err := h.d.SVCAdd(frontend, backends, revnat); err != nil {
+		return apierror.Error(PutServiceIDFailureCode, err)
+	}
+
+	return NewPutServiceIDCreated()
+}
+
+type deleteServiceID struct {
+	d *Daemon
+}
+
+func NewDeleteServiceIDHandler(d *Daemon) DeleteServiceIDHandler {
+	return &deleteServiceID{d: d}
+}
+
+func (h *deleteServiceID) Handle(params DeleteServiceIDParams) middleware.Responder {
+	d := h.d
+	d.loadBalancer.BPFMapMU.Lock()
+	defer d.loadBalancer.BPFMapMU.Unlock()
+
+	svc, ok := d.loadBalancer.SVCMapID[types.ServiceID(params.ID)]
+	if !ok {
+		return NewDeleteServiceIDNotFound()
+	}
+
+	if err := h.d.svcDelete(svc); err != nil {
+		return apierror.Error(DeleteServiceIDFailureCode, err)
+	}
+
+	return NewDeleteServiceIDOK()
+}
+
+// Deletes a service by the frontend address
+func (d *Daemon) svcDeleteByFrontend(frontend *types.L3n4Addr) error {
+	d.loadBalancer.BPFMapMU.Lock()
+	defer d.loadBalancer.BPFMapMU.Unlock()
+
+	if svc, ok := d.loadBalancer.SVCMap[frontend.SHA256Sum()]; !ok {
+		return fmt.Errorf("Service frontend not found %+v", frontend)
+	} else {
+		return d.svcDelete(&svc)
+	}
+}
+
+func (d *Daemon) svcDelete(svc *types.LBSVC) error {
+	var svcKey lbmap.ServiceKey
+	if !svc.FE.IsIPv6() {
+		svcKey = lbmap.NewService4Key(svc.FE.IP, svc.FE.Port, 0)
+	} else {
+		svcKey = lbmap.NewService6Key(svc.FE.IP, svc.FE.Port, 0)
+	}
+
+	svcKey.SetBackend(0)
+
+	if err := lbmap.DeleteService(svcKey); err != nil {
 		return err
 	}
-	// TODO should we delete even if err is != nil?
 
-	d.loadBalancer.SVCMap = map[string]types.LBSVC{}
+	d.loadBalancer.DeleteService(svc)
+
 	return nil
 }
 
-// SVCGet returns a DeepCopied frontend with its backends.
-func (d *Daemon) SVCGet(feL3n4 types.L3n4Addr) (*types.LBSVC, error) {
-	feL3n4Uniq, err := feL3n4.SHA256Sum()
-	if err != nil {
-		return nil, err
+type getServiceID struct {
+	daemon *Daemon
+}
+
+func NewGetServiceIDHandler(d *Daemon) GetServiceIDHandler {
+	return &getServiceID{daemon: d}
+}
+
+func (h *getServiceID) Handle(params GetServiceIDParams) middleware.Responder {
+	d := h.daemon
+
+	d.loadBalancer.BPFMapMU.RLock()
+	defer d.loadBalancer.BPFMapMU.RUnlock()
+
+	if svc, ok := d.loadBalancer.SVCMapID[types.ServiceID(params.ID)]; ok {
+		return NewGetServiceIDOK().WithPayload(svc.GetModel())
+	} else {
+		return NewGetServiceIDNotFound()
 	}
-	return d.SVCGetBySHA256Sum(feL3n4Uniq)
 }
 
 // SVCGetBySHA256Sum returns a DeepCopied frontend with its backends.
-func (d *Daemon) SVCGetBySHA256Sum(feL3n4SHA256Sum string) (*types.LBSVC, error) {
+func (d *Daemon) svcGetBySHA256Sum(feL3n4SHA256Sum string) *types.LBSVC {
 	d.loadBalancer.BPFMapMU.RLock()
 	defer d.loadBalancer.BPFMapMU.RUnlock()
 
 	if v, ok := d.loadBalancer.SVCMap[feL3n4SHA256Sum]; !ok {
-		return nil, nil
+		return nil
 	} else {
 		// We will move the slice from the loadbalancer map which have a mutex. If
 		// we don't copy the slice we might risk changing memory that should be
@@ -223,26 +252,29 @@ func (d *Daemon) SVCGetBySHA256Sum(feL3n4SHA256Sum string) (*types.LBSVC, error)
 		return &types.LBSVC{
 			FE:  *v.FE.DeepCopy(),
 			BES: beL3n4AddrCpy,
-		}, nil
+		}
 	}
 }
 
-// SVCDump dumps a DeepCopy of the cilium's loadbalancer.
-func (d *Daemon) SVCDump() ([]types.LBSVC, error) {
-	dump := []types.LBSVC{}
+type getService struct {
+	d *Daemon
+}
 
-	d.loadBalancer.BPFMapMU.RLock()
-	defer d.loadBalancer.BPFMapMU.RUnlock()
+func NewGetServiceHandler(d *Daemon) GetServiceHandler {
+	return &getService{d: d}
+}
 
-	for _, v := range d.loadBalancer.SVCMap {
-		beL3n4AddrCpy := []types.L3n4Addr{}
-		for _, v := range v.BES {
-			beL3n4AddrCpy = append(beL3n4AddrCpy, v)
-		}
-		dump = append(dump, types.LBSVC{FE: *v.FE.DeepCopy(), BES: beL3n4AddrCpy})
+func (h *getService) Handle(params GetServiceParams) middleware.Responder {
+	list := []*models.Service{}
+
+	h.d.loadBalancer.BPFMapMU.RLock()
+	defer h.d.loadBalancer.BPFMapMU.RUnlock()
+
+	for _, v := range h.d.loadBalancer.SVCMap {
+		list = append(list, v.GetModel())
 	}
 
-	return dump, nil
+	return NewGetServiceOK().WithPayload(list)
 }
 
 // RevNATAdd deep copies the given revNAT address to the cilium lbmap with the given id.
@@ -344,6 +376,7 @@ func (d *Daemon) SyncLBMap() error {
 	defer d.loadBalancer.BPFMapMU.Unlock()
 
 	newSVCMap := types.SVCMap{}
+	newSVCMapID := types.SVCMapID{}
 	newRevNATMap := types.RevNATMap{}
 	failedSyncSVC := []types.LBSVC{}
 	failedSyncRevNAT := map[types.ServiceID]types.L3n4Addr{}
@@ -360,10 +393,8 @@ func (d *Daemon) SyncLBMap() error {
 			log.Errorf("%s", err)
 			return
 		}
-		if err := newSVCMap.AddFEnBE(fe, be, svcKey.GetBackend()); err != nil {
-			log.Errorf("%s", err)
-			return
-		}
+
+		newSVCMap.AddFEnBE(fe, be, svcKey.GetBackend())
 	}
 
 	parseRevNATEntries := func(key bpf.MapKey, value bpf.MapValue) {
@@ -453,6 +484,7 @@ func (d *Daemon) SyncLBMap() error {
 				continue
 			}
 			newSVCMap[k] = svc
+			newSVCMapID[svc.FE.ID] = &svc
 		}
 	}
 
@@ -489,6 +521,7 @@ func (d *Daemon) SyncLBMap() error {
 	}
 
 	d.loadBalancer.SVCMap = newSVCMap
+	d.loadBalancer.SVCMapID = newSVCMapID
 	d.loadBalancer.RevNATMap = newRevNATMap
 
 	return nil

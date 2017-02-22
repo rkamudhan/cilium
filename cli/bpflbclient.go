@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-package lb
+package main
 
 import (
 	"errors"
@@ -120,10 +120,7 @@ func (cli *LBClient) SVCDump() ([]types.LBSVC, error) {
 			log.Errorf("%s", err)
 			return
 		}
-		if err := svcs.AddFEnBE(fe, be, svcKey.GetBackend()); err != nil {
-			log.Errorf("%s", err)
-			return
-		}
+		svcs.AddFEnBE(fe, be, svcKey.GetBackend())
 	}
 	if err := lbmap.Service4Map.Dump(lbmap.Service4DumpParser, parseSVCEntries); err != nil {
 		return nil, err
